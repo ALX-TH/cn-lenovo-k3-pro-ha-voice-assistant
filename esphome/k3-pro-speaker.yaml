@@ -1,0 +1,778 @@
+substitutions:
+  name: lenovo-3k-pro-speaker-613b3e
+  friendly_name: Lenovo 3K PRO Speaker 613b3e
+
+  # Key ladder thresholds (V at GPIO8, 100k pull-up to 3V3)
+  key_power_max: "0.17"
+  key_play_max: "0.68"
+  key_phone_max: "1.50"
+  key_next_max: "2.35"
+  key_prev_max: "2.95"
+
+  # INMP441 is quiet at 16 bit - digital gain for wake word / voice assistant
+  mic_gain: "4"
+  led_brightness: "40%"
+  # Volume cap: protects 4 Ohm speaker from distortion and USB 5 V from sagging
+  volume_max: "85%"
+  # Timer alarm auto-stops after this time if nobody reacts
+  timer_ring_max: 15min
+
+  sound_base: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.5.0
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# INFO in normal use; switch to DEBUG only for troubleshooting
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: "*********************************"
+  on_client_connected:
+    - script.execute: start_wake_word
+  on_client_disconnected:
+    - voice_assistant.stop:
+    - micro_wake_word.stop:
+
+ota:
+  - platform: esphome
+
+safe_mode:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Lenovo Speaker 613b3e"
+    password: !secret wifi_password
+
+captive_portal:
+
+globals:
+  - id: timer_ringing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+# ---------------------------------------------------------------------------
+# Audio: two separate I2S buses (S3 has two I2S peripherals)
+# ---------------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_out              # -> MAX98357A
+    i2s_bclk_pin: GPIO4
+    i2s_lrclk_pin: GPIO5
+  - id: i2s_in               # <- INMP441
+    i2s_bclk_pin: GPIO13
+    i2s_lrclk_pin: GPIO14
+
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_audio_id: i2s_in
+    adc_type: external
+    i2s_din_pin: GPIO15
+    pdm: false
+    channel: left            # INMP441 L/R -> GND
+    bits_per_sample: 32bit
+    sample_rate: 16000
+    correct_dc_offset: true
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_audio_id: i2s_out
+    dac_type: external
+    i2s_dout_pin: GPIO6
+    channel: mono            # MAX98357A SD high = left; mono feeds both slots
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    buffer_duration: 100ms
+
+  - platform: mixer
+    id: audio_mixer
+    output_speaker: i2s_speaker
+    num_channels: 1
+    source_speakers:
+      - id: announcement_mixer_input
+        timeout: never
+      - id: media_mixer_input
+        timeout: never
+
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixer_input
+
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixer_input
+
+media_player:
+  - platform: speaker
+    id: speaker_media_player
+    name: None
+    volume_initial: 0.5
+    volume_increment: 0.05
+    volume_max: ${volume_max}
+    media_pipeline:
+      speaker: media_resampling_speaker
+      num_channels: 1
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      num_channels: 1
+    files:
+      - id: wake_sound_file
+        file: ${sound_base}/wake_word_triggered.flac
+      - id: timer_sound_file
+        file: ${sound_base}/timer_finished.flac
+    # "Wake word during music" = OFF -> no wake word while music plays
+    on_play:
+      - if:
+          condition:
+            switch.is_off: wake_word_during_music
+          then:
+            - micro_wake_word.stop:
+    on_pause:
+      - script.execute: start_wake_word
+    on_idle:
+      - script.execute: start_wake_word
+
+# ---------------------------------------------------------------------------
+# Voice assistant
+# ---------------------------------------------------------------------------
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: mic
+    gain_factor: ${mic_gain}
+  models:
+    - model: okay_nabu
+  # On-device Voice Activity Detection: wake word is accepted only while
+  # real speech is detected (fewer false triggers from music / TV)
+  vad:
+  # NOTE: stop_after_detection defaults to true -> mww stops after each
+  # detection and is restarted by script start_wake_word
+  on_wake_word_detected:
+    - if:
+        condition:
+          lambda: return id(timer_ringing);
+        then:
+          # wake word only silences a ringing timer
+          - script.execute: stop_timer_ring
+        else:
+          - voice_assistant.start:
+              wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone:
+    microphone: mic
+    gain_factor: ${mic_gain}
+  media_player: speaker_media_player
+  micro_wake_word: mww
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 1.0
+  on_listening:
+    - mixer_speaker.apply_ducking:
+        id: media_mixer_input
+        decibel_reduction: 20
+        duration: 0s
+    - script.execute:
+        id: led_set
+        r: 0.0
+        g: 0.0
+        b: 1.0
+    - if:
+        condition:
+          switch.is_on: wake_sound
+        then:
+          - media_player.speaker.play_on_device_media_file:
+              media_file: wake_sound_file
+              announcement: true
+  on_stt_vad_end:
+    - script.execute:
+        id: led_set
+        r: 1.0
+        g: 0.6
+        b: 0.0
+  on_tts_start:
+    - script.execute:
+        id: led_set
+        r: 0.0
+        g: 1.0
+        b: 0.0
+  on_error:
+    - script.execute:
+        id: led_flash
+        r: 1.0
+        g: 0.0
+        b: 0.0
+  on_end:
+    - wait_until:
+        not:
+          voice_assistant.is_running:
+    - mixer_speaker.apply_ducking:
+        id: media_mixer_input
+        decibel_reduction: 0
+        duration: 1s
+    - if:
+        condition:
+          not:
+            script.is_running: led_flash
+        then:
+          - light.turn_off: status_led
+    - script.execute: start_wake_word
+  # Voice timers ("set a timer for 5 minutes")
+  on_timer_finished:
+    - script.execute: timer_ring
+
+script:
+  # (Re)start wake word detection only when every condition allows it
+  - id: start_wake_word
+    mode: restart
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_off: standby_switch
+              - switch.is_off: mic_mute
+              - switch.is_on: wake_word_enabled
+              - api.connected:
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  micro_wake_word.is_running:
+              - or:
+                  - switch.is_on: wake_word_during_music
+                  - not:
+                      media_player.is_playing: speaker_media_player
+          then:
+            - micro_wake_word.start:
+
+  # Status LED: steady colour while the speaker is doing something
+  - id: led_set
+    mode: restart
+    parameters:
+      r: float
+      g: float
+      b: float
+    then:
+      - light.turn_on:
+          id: status_led
+          brightness: ${led_brightness}
+          red: !lambda return r;
+          green: !lambda return g;
+          blue: !lambda return b;
+
+  # Status LED: short feedback flash, then off
+  - id: led_flash
+    mode: restart
+    parameters:
+      r: float
+      g: float
+      b: float
+    then:
+      - light.turn_on:
+          id: status_led
+          brightness: ${led_brightness}
+          red: !lambda return r;
+          green: !lambda return g;
+          blue: !lambda return b;
+      - delay: 400ms
+      - light.turn_off: status_led
+
+  # Timer alarm: repeat sound + orange flash until a key / wake word / timeout
+  - id: timer_ring
+    mode: single
+    then:
+      - globals.set:
+          id: timer_ringing
+          value: "true"
+      - switch.turn_on: amp_enable        # ring even in standby
+      - script.execute: timer_ring_timeout
+      - while:
+          condition:
+            lambda: return id(timer_ringing);
+          then:
+            - media_player.speaker.play_on_device_media_file:
+                media_file: timer_sound_file
+                announcement: true
+            - script.execute:
+                id: led_flash
+                r: 1.0
+                g: 0.4
+                b: 0.0
+            - delay: 2s
+
+  - id: timer_ring_timeout
+    mode: restart
+    then:
+      - delay: ${timer_ring_max}
+      - script.execute: stop_timer_ring
+
+  - id: stop_timer_ring
+    mode: single
+    then:
+      - globals.set:
+          id: timer_ringing
+          value: "false"
+      - script.stop: timer_ring
+      - script.stop: timer_ring_timeout
+      - media_player.stop:
+          id: speaker_media_player
+          announcement: true
+      - if:
+          condition:
+            switch.is_on: standby_switch
+          then:
+            - switch.turn_off: amp_enable
+      - light.turn_off: status_led
+      - script.execute: start_wake_word
+
+  # Central key handling: key = power|play|phone|next|prev,
+  # kind = click|double_click|long_press
+  - id: key_action
+    mode: queued
+    max_runs: 3
+    parameters:
+      key: string
+      kind: string
+    then:
+      - if:
+          condition:
+            lambda: return id(timer_ringing);
+          then:
+            # any key silences a ringing timer, nothing else
+            - script.execute: stop_timer_ring
+          else:
+            - if:
+                condition:
+                  lambda: return key == "power";
+                then:
+                  - switch.toggle: standby_switch
+                  - script.execute:
+                      id: led_flash
+                      r: !lambda 'return id(standby_switch).state ? 1.0f : 0.0f;'
+                      g: !lambda 'return id(standby_switch).state ? 0.0f : 1.0f;'
+                      b: 0.0
+                else:
+                  - if:
+                      condition:
+                        switch.is_off: standby_switch
+                      then:
+                        - script.execute:
+                            id: key_action_active
+                            key: !lambda return key;
+                            kind: !lambda return kind;
+
+  # Keys while not in standby
+  - id: key_action_active
+    mode: queued
+    max_runs: 3
+    parameters:
+      key: string
+      kind: string
+    then:
+      # PLAY: click = play/pause, long = stop (double click -> HA event only)
+      - if:
+          condition:
+            lambda: return key == "play" && kind == "click";
+          then:
+            - media_player.toggle: speaker_media_player
+      - if:
+          condition:
+            lambda: return key == "play" && kind == "long_press";
+          then:
+            - media_player.stop: speaker_media_player
+      # PHONE: click = push-to-talk, long = microphone mute toggle
+      - if:
+          condition:
+            lambda: return key == "phone" && kind == "click";
+          then:
+            - if:
+                condition:
+                  switch.is_on: mic_mute
+                then:
+                  - script.execute:
+                      id: led_flash
+                      r: 1.0
+                      g: 0.0
+                      b: 0.0
+                else:
+                  - if:
+                      condition:
+                        voice_assistant.is_running:
+                      then:
+                        - voice_assistant.stop:
+                      else:
+                        - micro_wake_word.stop:
+                        - voice_assistant.start:
+      - if:
+          condition:
+            lambda: return key == "phone" && kind == "long_press";
+          then:
+            - switch.toggle: mic_mute
+            - script.execute:
+                id: led_flash
+                r: !lambda 'return id(mic_mute).state ? 1.0f : 0.0f;'
+                g: !lambda 'return id(mic_mute).state ? 0.0f : 1.0f;'
+                b: 0.0
+      # NEXT / PREV: click = volume, long = HA event only (next/prev track)
+      - if:
+          condition:
+            lambda: return key == "next" && kind == "click";
+          then:
+            - media_player.volume_up: speaker_media_player
+      - if:
+          condition:
+            lambda: return key == "prev" && kind == "click";
+          then:
+            - media_player.volume_down: speaker_media_player
+
+# ---------------------------------------------------------------------------
+# Switches
+# ---------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: amp_enable
+    pin: GPIO7               # MAX98357A SD: HIGH = on, LOW = shutdown
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  - platform: template
+    id: standby_switch
+    name: "Standby"
+    icon: mdi:power-sleep
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - media_player.stop: speaker_media_player
+      - voice_assistant.stop:
+      - micro_wake_word.stop:
+      - switch.turn_off: amp_enable
+    turn_off_action:
+      - switch.turn_on: amp_enable
+      - script.execute: start_wake_word
+
+  - platform: template
+    id: mic_mute
+    name: "Microphone mute"
+    icon: mdi:microphone-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - voice_assistant.stop:
+      - micro_wake_word.stop:
+    turn_off_action:
+      - script.execute: start_wake_word
+
+  - platform: template
+    id: wake_word_enabled
+    name: "Wake word"
+    icon: mdi:account-voice
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - script.execute: start_wake_word
+    turn_off_action:
+      - micro_wake_word.stop:
+
+  - platform: template
+    id: wake_word_during_music
+    name: "Wake word during music"
+    icon: mdi:music-note
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - script.execute: start_wake_word
+    turn_off_action:
+      - if:
+          condition:
+            media_player.is_playing: speaker_media_player
+          then:
+            - micro_wake_word.stop:
+
+  - platform: template
+    id: wake_sound
+    name: "Wake sound"
+    icon: mdi:bell-ring
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# ---------------------------------------------------------------------------
+# Buttons: original resistor ladder on old U1 pin 2 -> GPIO8 (ADC1_CH7)
+#   POWER 0R | PLAY 12k | PHONE 45k | NEXT 147k | PREV 470k
+# Binary sensors are internal (raw key state); Home Assistant gets one
+# "event" entity per button - no extra HA permissions needed.
+# ---------------------------------------------------------------------------
+event:
+  - platform: template
+    id: ev_power
+    name: "Button Power"
+    icon: mdi:power
+    device_class: button
+    event_types: [click]
+  - platform: template
+    id: ev_play
+    name: "Button Play"
+    icon: mdi:play-pause
+    device_class: button
+    event_types: [click, double_click, long_press]
+  - platform: template
+    id: ev_phone
+    name: "Button Phone"
+    icon: mdi:microphone-message
+    device_class: button
+    event_types: [click, long_press]
+  - platform: template
+    id: ev_next
+    name: "Button Next"
+    icon: mdi:skip-next
+    device_class: button
+    event_types: [click, long_press]
+  - platform: template
+    id: ev_prev
+    name: "Button Prev"
+    icon: mdi:skip-previous
+    device_class: button
+    event_types: [click, long_press]
+
+binary_sensor:
+  # Voice Activity (from micro_wake_word VAD model). Valid only while the
+  # speaker listens for the wake word (not in standby / during assistant).
+  - platform: template
+    id: voice_activity
+    name: "Voice Activity"
+    icon: mdi:account-voice
+    device_class: sound
+    lambda: |-
+      return id(mww).is_running() && id(mww).get_vad_state();
+    filters:
+      - delayed_off: 1s
+
+  - platform: template
+    id: key_power
+    internal: true
+    lambda: return id(key_adc).state < ${key_power_max};
+    filters:
+      - delayed_on_off: 40ms
+    on_click:
+      - min_length: 40ms
+        max_length: 1s
+        then:
+          - event.trigger:
+              id: ev_power
+              event_type: click
+          - script.execute:
+              id: key_action
+              key: power
+              kind: click
+
+  - platform: template
+    id: key_play
+    internal: true
+    lambda: |-
+      float v = id(key_adc).state;
+      return v >= ${key_power_max} && v < ${key_play_max};
+    filters:
+      - delayed_on_off: 40ms
+    on_multi_click:
+      - timing:
+          - ON for 40ms to 600ms
+          - OFF for at least 350ms
+        then:
+          - event.trigger:
+              id: ev_play
+              event_type: click
+          - script.execute:
+              id: key_action
+              key: play
+              kind: click
+      - timing:
+          - ON for 40ms to 600ms
+          - OFF for at most 350ms
+          - ON for 40ms to 600ms
+          - OFF for at least 50ms
+        then:
+          - event.trigger:
+              id: ev_play
+              event_type: double_click
+          - script.execute:
+              id: key_action
+              key: play
+              kind: double_click
+      - timing:
+          - ON for at least 800ms
+        then:
+          - event.trigger:
+              id: ev_play
+              event_type: long_press
+          - script.execute:
+              id: key_action
+              key: play
+              kind: long_press
+
+  - platform: template
+    id: key_phone
+    internal: true
+    lambda: |-
+      float v = id(key_adc).state;
+      return v >= ${key_play_max} && v < ${key_phone_max};
+    filters:
+      - delayed_on_off: 40ms
+    on_click:
+      - min_length: 40ms
+        max_length: 600ms
+        then:
+          - event.trigger:
+              id: ev_phone
+              event_type: click
+          - script.execute:
+              id: key_action
+              key: phone
+              kind: click
+      - min_length: 800ms
+        max_length: 5s
+        then:
+          - event.trigger:
+              id: ev_phone
+              event_type: long_press
+          - script.execute:
+              id: key_action
+              key: phone
+              kind: long_press
+
+  - platform: template
+    id: key_next
+    internal: true
+    lambda: |-
+      float v = id(key_adc).state;
+      return v >= ${key_phone_max} && v < ${key_next_max};
+    filters:
+      - delayed_on_off: 40ms
+    on_click:
+      - min_length: 40ms
+        max_length: 600ms
+        then:
+          - event.trigger:
+              id: ev_next
+              event_type: click
+          - script.execute:
+              id: key_action
+              key: next
+              kind: click
+      - min_length: 600ms
+        max_length: 3s
+        then:
+          - event.trigger:
+              id: ev_next
+              event_type: long_press
+          - script.execute:
+              id: key_action
+              key: next
+              kind: long_press
+
+  - platform: template
+    id: key_prev
+    internal: true
+    lambda: |-
+      float v = id(key_adc).state;
+      return v >= ${key_next_max} && v < ${key_prev_max};
+    filters:
+      - delayed_on_off: 40ms
+    on_click:
+      - min_length: 40ms
+        max_length: 600ms
+        then:
+          - event.trigger:
+              id: ev_prev
+              event_type: click
+          - script.execute:
+              id: key_action
+              key: prev
+              kind: click
+      - min_length: 600ms
+        max_length: 3s
+        then:
+          - event.trigger:
+              id: ev_prev
+              event_type: long_press
+          - script.execute:
+              id: key_action
+              key: prev
+              kind: long_press
+
+# ---------------------------------------------------------------------------
+# Sensors / diagnostics
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: adc
+    id: key_adc
+    pin: GPIO8
+    attenuation: 12db
+    update_interval: 20ms
+    internal: true
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: internal_temperature
+    name: "Chip Temperature"
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+  - platform: version
+    name: "ESPHome Version"
+    hide_timestamp: true
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+  - platform: safe_mode
+    name: "Safe Mode Boot"
+    entity_category: config
+
+# ---------------------------------------------------------------------------
+# Onboard RGB LED (WS2812 on GPIO48, "RGB" solder jumper must be closed)
+# Internal: driven only by the speaker itself (listening / thinking /
+# replying / error / timer / button feedback), never left on.
+# ---------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    internal: true
+    restore_mode: ALWAYS_OFF
+    pin: GPIO48
+    num_leds: 1
+    channel_colors: GRB
+    chipset: WS2812
+    default_transition_length: 0s
