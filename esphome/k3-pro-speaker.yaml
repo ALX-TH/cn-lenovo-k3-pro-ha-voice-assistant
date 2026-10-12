@@ -22,13 +22,26 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2025.5.0
+  min_version: 2026.8.0
 
+# Performance tuning taken from Home Assistant Voice PE firmware
 esp32:
   board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
   flash_size: 16MB
   framework:
     type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      # Code + read-only data run from PSRAM: considerably speeds up
+      # micro_wake_word and keeps audio going during flash operations
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      # TLS buffers in PSRAM: HTTPS TTS / media downloads no longer fail
+      # when internal RAM runs low
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
 
 psram:
   mode: octal
@@ -41,11 +54,6 @@ logger:
 api:
   encryption:
     key: "*********************************"
-  on_client_connected:
-    - script.execute: start_wake_word
-  on_client_disconnected:
-    - voice_assistant.stop:
-    - micro_wake_word.stop:
 
 ota:
   - platform: esphome
@@ -100,11 +108,14 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 16bit
     buffer_duration: 100ms
+    # Keep I2S running: no start-up gap that swallows the first syllables
+    timeout: never
 
   - platform: mixer
     id: audio_mixer
     output_speaker: i2s_speaker
     num_channels: 1
+    task_stack_in_psram: true
     source_speakers:
       - id: announcement_mixer_input
         timeout: never
@@ -114,10 +125,14 @@ speaker:
   - platform: resampler
     id: media_resampling_speaker
     output_speaker: media_mixer_input
+    sample_rate: 48000
+    bits_per_sample: 16
 
   - platform: resampler
     id: announcement_resampling_speaker
     output_speaker: announcement_mixer_input
+    sample_rate: 48000
+    bits_per_sample: 16
 
 media_player:
   - platform: speaker
@@ -126,11 +141,16 @@ media_player:
     volume_initial: 0.5
     volume_increment: 0.05
     volume_max: ${volume_max}
+    # HA transcodes to 48 kHz FLAC: cheapest codec to decode, no resampling
     media_pipeline:
       speaker: media_resampling_speaker
+      format: FLAC
+      sample_rate: 48000
       num_channels: 1
     announcement_pipeline:
       speaker: announcement_resampling_speaker
+      format: FLAC
+      sample_rate: 48000
       num_channels: 1
     files:
       - id: wake_sound_file
@@ -157,23 +177,78 @@ micro_wake_word:
   microphone:
     microphone: mic
     gain_factor: ${mic_gain}
+  # Like Voice PE: wake word keeps running during the whole conversation,
+  # so it never gets "lost" if a pipeline ends without on_end
+  stop_after_detection: false
   models:
-    - model: okay_nabu
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+    # "Stop" - enabled only while a reply / timer alarm is playing
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+      internal: true
   # On-device Voice Activity Detection: wake word is accepted only while
   # real speech is detected (fewer false triggers from music / TV)
   vad:
-  # NOTE: stop_after_detection defaults to true -> mww stops after each
-  # detection and is restarted by script start_wake_word
   on_wake_word_detected:
     - if:
         condition:
           lambda: return id(timer_ringing);
         then:
-          # wake word only silences a ringing timer
+          # wake word / "stop" only silences a ringing timer
           - script.execute: stop_timer_ring
         else:
-          - voice_assistant.start:
-              wake_word: !lambda return wake_word;
+          - if:
+              condition:
+                voice_assistant.is_running:
+              then:
+                # wake word / "stop" during a conversation cancels it
+                - voice_assistant.stop:
+              else:
+                - if:
+                    condition:
+                      media_player.is_announcing: speaker_media_player
+                    then:
+                      - media_player.stop:
+                          id: speaker_media_player
+                          announcement: true
+                    else:
+                      # Wake sound BEFORE the pipeline starts, so it is not
+                      # recorded and sent to speech-to-text
+                      - if:
+                          condition:
+                            switch.is_on: wake_sound
+                          then:
+                            - media_player.speaker.play_on_device_media_file:
+                                media_file: wake_sound_file
+                                announcement: true
+                            - delay: 300ms
+                      - voice_assistant.start:
+                          wake_word: !lambda return wake_word;
+
+select:
+  - platform: template
+    id: wake_word_sensitivity
+    name: "Wake word sensitivity"
+    icon: mdi:ear-hearing
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Slightly sensitive
+    options:
+      - Slightly sensitive
+      - Moderately sensitive
+      - Very sensitive
+    # Cutoffs from Voice PE, valid for okay_nabu@20241226.3 only
+    on_value:
+      lambda: |-
+        if (x == "Slightly sensitive") {
+          id(okay_nabu).set_probability_cutoff(217);  // 0.85
+        } else if (x == "Moderately sensitive") {
+          id(okay_nabu).set_probability_cutoff(176);  // 0.69
+        } else if (x == "Very sensitive") {
+          id(okay_nabu).set_probability_cutoff(143);  // 0.56
+        }
 
 voice_assistant:
   id: va
@@ -182,44 +257,61 @@ voice_assistant:
     gain_factor: ${mic_gain}
   media_player: speaker_media_player
   micro_wake_word: mww
+  # Wake word is handled by micro_wake_word above, not by the pipeline
+  use_wake_word: false
   noise_suppression_level: 2
   auto_gain: 31dBFS
   volume_multiplier: 1.0
-  on_listening:
+  # Start wake word only once HA has subscribed to the voice pipeline
+  # (api connected alone is too early -> first wake word went nowhere)
+  on_client_connected:
+    - script.execute: start_wake_word
+  on_client_disconnected:
+    - voice_assistant.stop:
+    - micro_wake_word.stop:
+  on_start:
     - mixer_speaker.apply_ducking:
         id: media_mixer_input
         decibel_reduction: 20
         duration: 0s
+  on_listening:
     - script.execute:
         id: led_set
         r: 0.0
         g: 0.0
         b: 1.0
-    - if:
-        condition:
-          switch.is_on: wake_sound
-        then:
-          - media_player.speaker.play_on_device_media_file:
-              media_file: wake_sound_file
-              announcement: true
   on_stt_vad_end:
     - script.execute:
         id: led_set
         r: 1.0
         g: 0.6
         b: 0.0
+  # Streaming TTS: reply starts here (non-empty x = TTS stream url)
+  on_intent_progress:
+    - if:
+        condition:
+          lambda: return !x.empty();
+        then:
+          - script.execute: reply_started
   on_tts_start:
-    - script.execute:
-        id: led_set
-        r: 0.0
-        g: 1.0
-        b: 0.0
+    - if:
+        condition:
+          not:
+            script.is_running: activate_stop_word_once
+        then:
+          - script.execute: reply_started
   on_error:
-    - script.execute:
-        id: led_flash
-        r: 1.0
-        g: 0.0
-        b: 0.0
+    # Ignore "no speech heard" and duplicate wake ups (another satellite
+    # answered) - these are not real failures
+    - if:
+        condition:
+          lambda: return code != "duplicate_wake_up_detected" && code != "stt-no-text-recognized";
+        then:
+          - script.execute:
+              id: led_flash
+              r: 1.0
+              g: 0.0
+              b: 0.0
   on_end:
     - wait_until:
         not:
@@ -240,6 +332,38 @@ voice_assistant:
     - script.execute: timer_ring
 
 script:
+  - id: reply_started
+    then:
+      - script.execute:
+          id: led_set
+          r: 0.0
+          g: 1.0
+          b: 0.0
+      - script.execute: activate_stop_word_once
+
+  # "Stop" word for long replies (from Voice PE): enabled 1 s after the
+  # reply starts playing, disabled when it ends
+  - id: activate_stop_word_once
+    then:
+      - wait_until:
+          condition:
+            media_player.is_announcing: speaker_media_player
+          timeout: 5s
+      - delay: 1s
+      - if:
+          condition:
+            lambda: return !id(timer_ringing);
+          then:
+            - micro_wake_word.enable_model: stop
+            - wait_until:
+                not:
+                  media_player.is_announcing: speaker_media_player
+            - if:
+                condition:
+                  lambda: return !id(timer_ringing);
+                then:
+                  - micro_wake_word.disable_model: stop
+
   # (Re)start wake word detection only when every condition allows it
   - id: start_wake_word
     mode: restart
@@ -251,8 +375,6 @@ script:
               - switch.is_off: mic_mute
               - switch.is_on: wake_word_enabled
               - api.connected:
-              - not:
-                  voice_assistant.is_running:
               - not:
                   micro_wake_word.is_running:
               - or:
@@ -302,6 +424,8 @@ script:
           id: timer_ringing
           value: "true"
       - switch.turn_on: amp_enable        # ring even in standby
+      - micro_wake_word.enable_model: stop
+      - script.execute: start_wake_word   # "stop" works even after on_end
       - script.execute: timer_ring_timeout
       - while:
           condition:
@@ -331,6 +455,7 @@ script:
           value: "false"
       - script.stop: timer_ring
       - script.stop: timer_ring_timeout
+      - micro_wake_word.disable_model: stop
       - media_player.stop:
           id: speaker_media_player
           announcement: true
@@ -418,7 +543,6 @@ script:
                       then:
                         - voice_assistant.stop:
                       else:
-                        - micro_wake_word.stop:
                         - voice_assistant.start:
       - if:
           condition:
