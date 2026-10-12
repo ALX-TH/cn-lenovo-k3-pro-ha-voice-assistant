@@ -49,6 +49,14 @@ ESPHome, конфіг в `esphome/k3-pro-speaker.yaml`. Потрібен ESPHome
 
 ## Home Assistant
 
-Пристрій підхоплюється через ESPHome інтеграцію. Далі в налаштуваннях пристрою вибрати свій Assist пайплайн. Якщо відповідь довго "думає", постав **Finished speaking detection** на Aggressive.
+Пристрій підхоплюється через ESPHome інтеграцію. Далі в налаштуваннях пристрою вибрати свій Assist пайплайн. Якщо відповідь довго "думає", постав **Finished speaking detection** (в укр. інтерфейсі "Виявлення завершення мовлення") на Aggressive.
+
+Так воно виглядає на сторінці пристрою:
+
+<p>
+  <img src="photos/ha/ha_1.png" width="32%">
+  <img src="photos/ha/ha_2.png" width="32%">
+  <img src="photos/ha/ha_3.png" width="32%">
+</p>
 
 В `homeassistant/k3_pro_automations.yaml` є приклад автоматизації: вимикає wake word на ніч.
