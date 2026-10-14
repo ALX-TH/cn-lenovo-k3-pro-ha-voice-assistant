@@ -16,6 +16,9 @@ substitutions:
   volume_max: "85%"
   # Timer alarm auto-stops after this time if nobody reacts
   timer_ring_max: 15min
+  # End of command: this much silence (on-device VAD) after speech ->
+  # stop recording, HA starts processing without waiting for its own VAD
+  speech_end_silence: 2s
 
   sound_base: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds
 
@@ -71,6 +74,27 @@ captive_portal:
 
 globals:
   - id: timer_ringing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Assistant is recording the command (on_listening .. on_stt_vad_end)
+  - id: va_listening
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Speech heard while recording (wake word itself does not count)
+  - id: va_heard_speech
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: va_listen_start
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  # Wake sound already played before voice_assistant.start (wake word /
+  # PHONE key). Without it (follow-up question, HA start_conversation)
+  # on_listening plays the sound itself
+  - id: va_cue_played
     type: bool
     restore_value: false
     initial_value: "false"
@@ -157,6 +181,13 @@ media_player:
         file: ${sound_base}/wake_word_triggered.flac
       - id: timer_sound_file
         file: ${sound_base}/timer_finished.flac
+      # Descending two-tone: "didn't catch that" / pipeline error
+      - id: error_sound_file
+        file: ${sound_base}/jack_disconnected.flac
+      - id: mute_on_sound_file
+        file: ${sound_base}/mute_switch_on.flac
+      - id: mute_off_sound_file
+        file: ${sound_base}/mute_switch_off.flac
     # "Wake word during music" = OFF -> no wake word while music plays
     on_play:
       - if:
@@ -213,16 +244,8 @@ micro_wake_word:
                           id: speaker_media_player
                           announcement: true
                     else:
-                      # Wake sound BEFORE the pipeline starts, so it is not
-                      # recorded and sent to speech-to-text
-                      - if:
-                          condition:
-                            switch.is_on: wake_sound
-                          then:
-                            - media_player.speaker.play_on_device_media_file:
-                                media_file: wake_sound_file
-                                announcement: true
-                            - delay: 300ms
+                      - script.execute: play_listen_cue
+                      - script.wait: play_listen_cue
                       - voice_assistant.start:
                           wake_word: !lambda return wake_word;
 
@@ -275,12 +298,37 @@ voice_assistant:
         decibel_reduction: 20
         duration: 0s
   on_listening:
+    # Follow-up question (assistant asked something back) or HA
+    # start_conversation: nobody played the wake sound yet, and the LED
+    # is hidden -> play it here so it is clear the speaker listens again
+    - if:
+        condition:
+          and:
+            - lambda: return !id(va_cue_played);
+            - switch.is_on: wake_sound
+        then:
+          - media_player.speaker.play_on_device_media_file:
+              media_file: wake_sound_file
+              announcement: true
+    - globals.set:
+        id: va_cue_played
+        value: "false"
+    - globals.set:
+        id: va_heard_speech
+        value: "false"
+    - lambda: id(va_listen_start) = millis();
+    - globals.set:
+        id: va_listening
+        value: "true"
     - script.execute:
         id: led_set
         r: 0.0
         g: 0.0
         b: 1.0
   on_stt_vad_end:
+    - globals.set:
+        id: va_listening
+        value: "false"
     - script.execute:
         id: led_set
         r: 1.0
@@ -301,8 +349,22 @@ voice_assistant:
         then:
           - script.execute: reply_started
   on_error:
-    # Ignore "no speech heard" and duplicate wake ups (another satellite
-    # answered) - these are not real failures
+    - globals.set:
+        id: va_listening
+        value: "false"
+    # Error sound for everything except duplicate wake ups (another
+    # satellite answered). Includes "no text recognized", otherwise the
+    # speaker just goes silent and looks frozen (LED is hidden)
+    - if:
+        condition:
+          and:
+            - switch.is_on: error_sound
+            - lambda: return code != "duplicate_wake_up_detected";
+        then:
+          - media_player.speaker.play_on_device_media_file:
+              media_file: error_sound_file
+              announcement: true
+    # Red flash only for real failures ("no speech heard" is not one)
     - if:
         condition:
           lambda: return code != "duplicate_wake_up_detected" && code != "stt-no-text-recognized";
@@ -313,6 +375,12 @@ voice_assistant:
               g: 0.0
               b: 0.0
   on_end:
+    - globals.set:
+        id: va_listening
+        value: "false"
+    - globals.set:
+        id: va_cue_played
+        value: "false"
     - wait_until:
         not:
           voice_assistant.is_running:
@@ -332,6 +400,23 @@ voice_assistant:
     - script.execute: timer_ring
 
 script:
+  # Wake sound BEFORE the pipeline starts, so it is not recorded and sent
+  # to speech-to-text
+  - id: play_listen_cue
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_on: wake_sound
+          then:
+            - globals.set:
+                id: va_cue_played
+                value: "true"
+            - media_player.speaker.play_on_device_media_file:
+                media_file: wake_sound_file
+                announcement: true
+            - delay: 300ms
+
   - id: reply_started
     then:
       - script.execute:
@@ -487,7 +572,30 @@ script:
                 condition:
                   lambda: return key == "power";
                 then:
-                  - switch.toggle: standby_switch
+                  # Sound feedback (LED is hidden inside the case). Going
+                  # to standby: sound first, standby (amp off) after it
+                  - if:
+                      condition:
+                        switch.is_off: standby_switch
+                      then:
+                        - media_player.speaker.play_on_device_media_file:
+                            media_file: mute_on_sound_file
+                            announcement: true
+                        - wait_until:
+                            condition:
+                              media_player.is_announcing: speaker_media_player
+                            timeout: 1s
+                        - wait_until:
+                            condition:
+                              not:
+                                media_player.is_announcing: speaker_media_player
+                            timeout: 3s
+                        - switch.turn_on: standby_switch
+                      else:
+                        - switch.turn_off: standby_switch
+                        - media_player.speaker.play_on_device_media_file:
+                            media_file: mute_off_sound_file
+                            announcement: true
                   - script.execute:
                       id: led_flash
                       r: !lambda 'return id(standby_switch).state ? 1.0f : 0.0f;'
@@ -531,6 +639,10 @@ script:
                 condition:
                   switch.is_on: mic_mute
                 then:
+                  # "Microphone is muted" reminder
+                  - media_player.speaker.play_on_device_media_file:
+                      media_file: mute_on_sound_file
+                      announcement: true
                   - script.execute:
                       id: led_flash
                       r: 1.0
@@ -543,12 +655,25 @@ script:
                       then:
                         - voice_assistant.stop:
                       else:
+                        - script.execute: play_listen_cue
+                        - script.wait: play_listen_cue
                         - voice_assistant.start:
       - if:
           condition:
             lambda: return key == "phone" && kind == "long_press";
           then:
             - switch.toggle: mic_mute
+            - if:
+                condition:
+                  switch.is_on: mic_mute
+                then:
+                  - media_player.speaker.play_on_device_media_file:
+                      media_file: mute_on_sound_file
+                      announcement: true
+                else:
+                  - media_player.speaker.play_on_device_media_file:
+                      media_file: mute_off_sound_file
+                      announcement: true
             - script.execute:
                 id: led_flash
                 r: !lambda 'return id(mic_mute).state ? 1.0f : 0.0f;'
@@ -638,6 +763,14 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
 
+  - platform: template
+    id: error_sound
+    name: "Error sound"
+    icon: mdi:alert-circle-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
 # ---------------------------------------------------------------------------
 # Buttons: original resistor ladder on old U1 pin 2 -> GPIO8 (ADC1_CH7)
 #   POWER 0R | PLAY 12k | PHONE 45k | NEXT 147k | PREV 470k
@@ -688,6 +821,46 @@ binary_sensor:
       return id(mww).is_running() && id(mww).get_vad_state();
     filters:
       - delayed_off: 1s
+
+  # End-of-command detection on the speaker itself: speech heard while
+  # recording, then ${speech_end_silence} of silence -> tell HA the audio has
+  # ended, HA starts speech-to-text right away. Not voice_assistant.stop:
+  # that one ABORTS the pipeline in HA (no reply). HA's own VAD (15 s
+  # timeout) stays as a fallback.
+  - platform: template
+    id: command_speech
+    internal: true
+    lambda: |-
+      return id(mww).is_running() && id(mww).get_vad_state();
+    filters:
+      - delayed_off: ${speech_end_silence}
+    on_release:
+      - if:
+          condition:
+            lambda: return id(va_listening) && id(va_heard_speech);
+          then:
+            - globals.set:
+                id: va_listening
+                value: "false"
+            - lambda: |-
+                auto *client = id(va).get_api_connection();
+                if (client == nullptr)
+                  return;
+                api::VoiceAssistantAudio msg;
+                msg.end = true;
+                if (!client->send_message(msg)) {
+                  ESP_LOGW("speech_end", "Audio end not sent");
+                  return;
+                }
+                ESP_LOGI("speech_end", "Silence after speech, audio end sent");
+                // HA sends no STT_VAD_END in this case. Feed the same event
+                // locally: voice_assistant stops its microphone stream the
+                // normal way (otherwise the mic stays claimed and "Microphone
+                // mute" / standby no longer stop the I2S microphone) and
+                // on_stt_vad_end runs (LED)
+                api::VoiceAssistantEventResponse ev;
+                ev.event_type = api::enums::VOICE_ASSISTANT_STT_VAD_END;
+                id(va).on_event(ev);
 
   - platform: template
     id: key_power
@@ -841,6 +1014,19 @@ binary_sensor:
               key: prev
               kind: long_press
 
+# Speech counts only from 500 ms after recording started: the wake word's
+# own VAD tail is ignored, but speech that follows the wake word without
+# a pause (VAD never goes off in between) is still caught
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          if (id(va_listening) && !id(va_heard_speech) &&
+              millis() - id(va_listen_start) > 500 &&
+              id(mww).is_running() && id(mww).get_vad_state()) {
+            id(va_heard_speech) = true;
+          }
+
 # ---------------------------------------------------------------------------
 # Sensors / diagnostics
 # ---------------------------------------------------------------------------
@@ -851,6 +1037,23 @@ sensor:
     attenuation: 12db
     update_interval: 20ms
     internal: true
+
+  # Microphone level in dBFS, exactly as wake word / voice assistant get it
+  # (same gain). For tuning ${mic_gain}: peak at 0 dB = clipping (gain too
+  # high), speech should stand well above the quiet-room RMS. Passive: only
+  # measures while the mic already runs (not in standby / mic mute)
+  - platform: sound_level
+    passive: true
+    measurement_duration: 1s
+    microphone:
+      microphone: mic
+      gain_factor: ${mic_gain}
+    peak:
+      name: "Mic Peak"
+      entity_category: diagnostic
+    rms:
+      name: "Mic Level"
+      entity_category: diagnostic
 
   - platform: wifi_signal
     name: "WiFi Signal"
