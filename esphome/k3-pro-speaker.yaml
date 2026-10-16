@@ -25,7 +25,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2026.8.0
+  min_version: 2026.9.0
 
 # Performance tuning taken from Home Assistant Voice PE firmware
 esp32:
@@ -158,36 +158,65 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 16
 
+# Sound files embedded in the firmware (downloaded at build time only).
+# Played through the announcement pipeline as "audio-file://<id>"
+audio_file:
+  - id: wake_sound_file
+    file: ${sound_base}/wake_word_triggered.flac
+  - id: timer_sound_file
+    file: ${sound_base}/timer_finished.flac
+  # Descending two-tone: "didn't catch that" / pipeline error
+  - id: error_sound_file
+    file: ${sound_base}/jack_disconnected.flac
+  - id: mute_on_sound_file
+    file: ${sound_base}/mute_switch_on.flac
+  - id: mute_off_sound_file
+    file: ${sound_base}/mute_switch_off.flac
+
+# Sendspin (Music Assistant): synchronized streaming / multi-room.
+# Music Assistant finds the speaker by itself (mDNS)
+sendspin:
+  id: sendspin_hub
+  task_stack_in_psram: true
+
+# Where the media player gets audio from (layout from Voice PE firmware)
+media_source:
+  - platform: audio_file
+    id: audio_file_announcement_source
+  - platform: audio_http
+    id: http_announcement_source
+    buffer_size: 250000
+  - platform: audio_http
+    id: http_media_source
+    buffer_size: 500000
+  - platform: sendspin
+    id: sendspin_media_source
+    codecs: [FLAC, PCM]   # FLAC: least CPU to decode
+
 media_player:
-  - platform: speaker
+  - platform: speaker_source
     id: speaker_media_player
     name: None
     volume_initial: 0.5
     volume_increment: 0.05
     volume_max: ${volume_max}
-    # HA transcodes to 48 kHz FLAC: cheapest codec to decode, no resampling
+    # Mono speaker: 48 kHz FLAC mono, cheapest codec to decode, no resampling
     media_pipeline:
       speaker: media_resampling_speaker
       format: FLAC
       sample_rate: 48000
       num_channels: 1
+      sources:
+        - http_media_source
+        - sendspin_media_source
     announcement_pipeline:
       speaker: announcement_resampling_speaker
       format: FLAC
       sample_rate: 48000
       num_channels: 1
-    files:
-      - id: wake_sound_file
-        file: ${sound_base}/wake_word_triggered.flac
-      - id: timer_sound_file
-        file: ${sound_base}/timer_finished.flac
-      # Descending two-tone: "didn't catch that" / pipeline error
-      - id: error_sound_file
-        file: ${sound_base}/jack_disconnected.flac
-      - id: mute_on_sound_file
-        file: ${sound_base}/mute_switch_on.flac
-      - id: mute_off_sound_file
-        file: ${sound_base}/mute_switch_off.flac
+      sources:
+        - audio_file_announcement_source
+        - http_announcement_source
     # "Wake word during music" = OFF -> no wake word while music plays
     on_play:
       - if:
@@ -307,8 +336,9 @@ voice_assistant:
             - lambda: return !id(va_cue_played);
             - switch.is_on: wake_sound
         then:
-          - media_player.speaker.play_on_device_media_file:
-              media_file: wake_sound_file
+          - media_player.play_media:
+              id: speaker_media_player
+              media_url: "audio-file://wake_sound_file"
               announcement: true
     - globals.set:
         id: va_cue_played
@@ -361,8 +391,9 @@ voice_assistant:
             - switch.is_on: error_sound
             - lambda: return code != "duplicate_wake_up_detected";
         then:
-          - media_player.speaker.play_on_device_media_file:
-              media_file: error_sound_file
+          - media_player.play_media:
+              id: speaker_media_player
+              media_url: "audio-file://error_sound_file"
               announcement: true
     # Red flash only for real failures ("no speech heard" is not one)
     - if:
@@ -412,8 +443,9 @@ script:
             - globals.set:
                 id: va_cue_played
                 value: "true"
-            - media_player.speaker.play_on_device_media_file:
-                media_file: wake_sound_file
+            - media_player.play_media:
+                id: speaker_media_player
+                media_url: "audio-file://wake_sound_file"
                 announcement: true
             - delay: 300ms
 
@@ -516,8 +548,9 @@ script:
           condition:
             lambda: return id(timer_ringing);
           then:
-            - media_player.speaker.play_on_device_media_file:
-                media_file: timer_sound_file
+            - media_player.play_media:
+                id: speaker_media_player
+                media_url: "audio-file://timer_sound_file"
                 announcement: true
             - script.execute:
                 id: led_flash
@@ -578,8 +611,9 @@ script:
                       condition:
                         switch.is_off: standby_switch
                       then:
-                        - media_player.speaker.play_on_device_media_file:
-                            media_file: mute_on_sound_file
+                        - media_player.play_media:
+                            id: speaker_media_player
+                            media_url: "audio-file://mute_on_sound_file"
                             announcement: true
                         - wait_until:
                             condition:
@@ -593,8 +627,9 @@ script:
                         - switch.turn_on: standby_switch
                       else:
                         - switch.turn_off: standby_switch
-                        - media_player.speaker.play_on_device_media_file:
-                            media_file: mute_off_sound_file
+                        - media_player.play_media:
+                            id: speaker_media_player
+                            media_url: "audio-file://mute_off_sound_file"
                             announcement: true
                   - script.execute:
                       id: led_flash
@@ -640,8 +675,9 @@ script:
                   switch.is_on: mic_mute
                 then:
                   # "Microphone is muted" reminder
-                  - media_player.speaker.play_on_device_media_file:
-                      media_file: mute_on_sound_file
+                  - media_player.play_media:
+                      id: speaker_media_player
+                      media_url: "audio-file://mute_on_sound_file"
                       announcement: true
                   - script.execute:
                       id: led_flash
@@ -667,12 +703,14 @@ script:
                 condition:
                   switch.is_on: mic_mute
                 then:
-                  - media_player.speaker.play_on_device_media_file:
-                      media_file: mute_on_sound_file
+                  - media_player.play_media:
+                      id: speaker_media_player
+                      media_url: "audio-file://mute_on_sound_file"
                       announcement: true
                 else:
-                  - media_player.speaker.play_on_device_media_file:
-                      media_file: mute_off_sound_file
+                  - media_player.play_media:
+                      id: speaker_media_player
+                      media_url: "audio-file://mute_off_sound_file"
                       announcement: true
             - script.execute:
                 id: led_flash
